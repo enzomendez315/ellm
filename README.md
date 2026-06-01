@@ -1,2 +1,2 @@
-# ellm
+# eLLM
 An LLM inference server.
