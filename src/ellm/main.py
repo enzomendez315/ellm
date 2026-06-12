@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from pydantic import BaseModel
 
 from ellm.model import load_model
 
@@ -18,11 +19,22 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_tokens: int = 50
+
+
 @app.post("/generate")
-def generate_response(request: Request):
+def generate_response(request: GenerateRequest):
+    prompt = request.prompt
     model = app.state.model
     tokenizer = app.state.tokenizer
-    return model, tokenizer
+
+    encoded_prompt = tokenizer.encode(text=prompt, return_tensors="pt")
+    encoded_response = model.generate(encoded_prompt)
+    response = tokenizer.decode(encoded_response)
+
+    return response
 
 
 @app.get("/health")
