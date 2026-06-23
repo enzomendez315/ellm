@@ -32,9 +32,9 @@ def generate_response(request: GenerateRequest):
 
     encoded_prompt = tokenizer.encode(text=prompt, return_tensors="pt")
     encoded_response = model.generate(encoded_prompt)
-    response = tokenizer.decode(encoded_response)
+    response = tokenizer.decode(encoded_response[0])  # Grab the sequence from the tensor
 
-    return response
+    return {"completion": response}
 
 
 @app.get("/health")
