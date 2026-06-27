@@ -26,12 +26,11 @@ class GenerateRequest(BaseModel):
 
 @app.post("/generate")
 def generate_response(request: GenerateRequest):
-    prompt = request.prompt
     model = app.state.model
     tokenizer = app.state.tokenizer
 
-    encoded_prompt = tokenizer.encode(text=prompt, return_tensors="pt")
-    encoded_response = model.generate(encoded_prompt)
+    encoded_prompt = tokenizer.encode(text=request.prompt, return_tensors="pt")
+    encoded_response = model.generate(encoded_prompt, max_length=request.max_tokens)
     response = tokenizer.decode(encoded_response[0])  # Grab the sequence from the tensor
 
     return {"completion": response}
