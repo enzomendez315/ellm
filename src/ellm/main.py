@@ -1,7 +1,10 @@
 from contextlib import asynccontextmanager
+from threading import Thread
 
 from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from transformers import TextIteratorStreamer
 
 from ellm.model import load_model
 
@@ -24,20 +27,24 @@ class GenerateRequest(BaseModel):
     max_tokens: int = 50
 
 
-@app.post("/generate")
-def generate_response(request: GenerateRequest):
+@app.post("/generate", response_class=StreamingResponse)
+async def generate_response(request: GenerateRequest):
     model = app.state.model
     tokenizer = app.state.tokenizer
 
-    encoded_prompt = tokenizer.encode(text=request.prompt, return_tensors="pt")
-    encoded_response = model.generate(encoded_prompt, max_length=request.max_tokens)
-    response = tokenizer.decode(encoded_response[0])  # Grab the sequence from the tensor
+    inputs = tokenizer(text=request.prompt, return_tensors="pt")
+    streamer = TextIteratorStreamer(tokenizer)
 
-    return {"completion": response}
+    # Run the generation in a separate thread so that it's non-blocking
+    generation_kwargs = dict(inputs, streamer=streamer, max_new_tokens=request.max_tokens)
+    thread = Thread(target=model.generate, kwargs=generation_kwargs)
+    thread.start()
+    for new_text in streamer:
+        yield new_text
 
 
 @app.get("/health")
-def get_health(request: Request):
+async def get_health(request: Request):
     return {"status": "ok"}
 
 
