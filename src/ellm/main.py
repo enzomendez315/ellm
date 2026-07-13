@@ -1,25 +1,11 @@
+import asyncio
 from contextlib import asynccontextmanager
-from threading import Thread
 
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from transformers import TextIteratorStreamer
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ellm.model import load_model
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Load resources at startup
-    app.state.model, app.state.tokenizer = load_model()
-    yield
-    # Clean up the models and release the resources
-    app.state.model = None
-    app.state.tokenizer = None
-
-
-app = FastAPI(lifespan=lifespan)
 
 
 class GenerateRequest(BaseModel):
@@ -27,20 +13,60 @@ class GenerateRequest(BaseModel):
     max_tokens: int = 50
 
 
-@app.post("/generate", response_class=StreamingResponse)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load resources at startup
+    app.state.queue = asyncio.Queue()
+    app.state.model, app.state.tokenizer = load_model()
+    app.state.task = asyncio.create_task(
+        start_engine_loop(app.state.queue, app.state.model, app.state.tokenizer)
+    )
+    yield
+
+    # Clean up and release resources
+    app.state.task.cancel()
+    try:
+        await app.state.task
+    except asyncio.CancelledError:
+        pass
+    app.state.model = None
+    app.state.tokenizer = None
+    app.state.queue = None
+
+
+def run_generation(
+    model: AutoModelForCausalLM, tokenizer: AutoTokenizer, request: GenerateRequest
+) -> str:
+    encoded_prompt = tokenizer.encode(text=request.prompt, return_tensors="pt")
+    encoded_completion = model.generate(encoded_prompt, max_new_tokens=request.max_tokens)
+    completion = tokenizer.decode(encoded_completion[0], skip_special_tokens=True)
+    return completion
+
+
+async def start_engine_loop(
+    queue: asyncio.Queue, model: AutoModelForCausalLM, tokenizer: AutoTokenizer
+):
+    while True:
+        # Pull an item from the queue and run generation in a separate thread
+        request, future = await queue.get()
+        try:
+            completion = await asyncio.to_thread(run_generation, model, tokenizer, request)
+            future.set_result(completion)
+        except Exception as e:
+            future.set_exception(e)
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/generate")
 async def generate_response(request: GenerateRequest):
-    model = app.state.model
-    tokenizer = app.state.tokenizer
-
-    inputs = tokenizer(text=request.prompt, return_tensors="pt")
-    streamer = TextIteratorStreamer(tokenizer)
-
-    # Run the generation in a separate thread so that it's non-blocking
-    generation_kwargs = dict(inputs, streamer=streamer, max_new_tokens=request.max_tokens)
-    thread = Thread(target=model.generate, kwargs=generation_kwargs)
-    thread.start()
-    for new_text in streamer:
-        yield new_text
+    queue: asyncio.Queue = app.state.queue
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    await queue.put((request, future))
+    result = await future
+    return {"completion": result}
 
 
 @app.get("/health")
