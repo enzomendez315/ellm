@@ -1,9 +1,9 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 
-
-def load_model():
-    model = AutoModelForCausalLM.from_pretrained(MODEL_ID)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+def load_model(model_name: str):
+    model = AutoModelForCausalLM.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     return model, tokenizer

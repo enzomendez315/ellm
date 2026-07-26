@@ -1,10 +1,11 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ellm.config import Settings
 from ellm.model import load_model
 
 
@@ -16,10 +17,13 @@ class GenerateRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load resources at startup
-    app.state.queue = asyncio.Queue()
-    app.state.model, app.state.tokenizer = load_model()
+    app.state.settings = Settings()
+    app.state.queue = asyncio.Queue(app.state.settings.max_queue_size)
+    app.state.model, app.state.tokenizer = load_model(app.state.settings.model_name)
     app.state.task = asyncio.create_task(
-        start_engine_loop(app.state.queue, app.state.model, app.state.tokenizer)
+        start_engine_loop(
+            app.state.queue, app.state.model, app.state.tokenizer, app.state.settings.max_batch_size
+        )
     )
     yield
 
@@ -35,25 +39,45 @@ async def lifespan(app: FastAPI):
 
 
 def run_generation(
-    model: AutoModelForCausalLM, tokenizer: AutoTokenizer, request: GenerateRequest
-) -> str:
-    encoded_prompt = tokenizer.encode(text=request.prompt, return_tensors="pt")
-    encoded_completion = model.generate(encoded_prompt, max_new_tokens=request.max_tokens)
-    completion = tokenizer.decode(encoded_completion[0], skip_special_tokens=True)
-    return completion
+    model: AutoModelForCausalLM, tokenizer: AutoTokenizer, requests: list[GenerateRequest]
+) -> list[str]:
+    prompts = [r.prompt for r in requests]
+    max_tokens = max(r.max_tokens for r in requests)
+
+    # Tokenizer returns a dict with input_ids and attention_mask
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+    outputs = model.generate(**inputs, max_new_tokens=max_tokens)
+
+    return tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
 
 async def start_engine_loop(
-    queue: asyncio.Queue, model: AutoModelForCausalLM, tokenizer: AutoTokenizer
+    queue: asyncio.Queue, model: AutoModelForCausalLM, tokenizer: AutoTokenizer, max_batch_size: int
 ):
     while True:
-        # Pull an item from the queue and run generation in a separate thread
+        # Pull at least one item from the queue
         request, future = await queue.get()
+        batch = [(request, future)]
+
+        # Increase the batch size if possible
+        while len(batch) < max_batch_size:
+            try:
+                batch.append(queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        requests = [r for r, _ in batch]
+        futures = [f for _, f in batch]
+        # Run generations in a separate thread
         try:
-            completion = await asyncio.to_thread(run_generation, model, tokenizer, request)
-            future.set_result(completion)
+            completions = await asyncio.to_thread(run_generation, model, tokenizer, requests)
+            for future, completion in zip(futures, completions, strict=True):
+                if not future.cancelled():
+                    future.set_result(completion)
         except Exception as e:
-            future.set_exception(e)
+            for future in futures:
+                if not future.cancelled():
+                    future.set_exception(e)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -70,10 +94,10 @@ async def generate_response(request: GenerateRequest):
 
 
 @app.get("/health")
-async def get_health(request: Request):
+async def get_health():
     return {"status": "ok"}
 
 
 @app.get("/metrics")
-def get_metrics(request: Request):
+def get_metrics():
     return "Getting metrics..."
