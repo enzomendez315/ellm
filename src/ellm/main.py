@@ -1,12 +1,19 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ellm.config import Settings
 from ellm.model import load_model
+
+TOKENS_GENERATED = Counter("ellm_tokens_generated_total", "Total tokens generated")
+REQUESTS_TOTAL = Counter("ellm_requests_total", "Total requests completed")
+REQUESTS_FAILED = Counter("ellm_requests_failed_total", "Total requests failed")
+QUEUE_DEPTH = Gauge("ellm_queue_depth", "Requests currently waiting in the queue")
+BATCH_SIZE = Histogram("ellm_batch_size", "Batch size per generation step")
 
 
 class GenerateRequest(BaseModel):
@@ -40,7 +47,7 @@ async def lifespan(app: FastAPI):
 
 def run_generation(
     model: AutoModelForCausalLM, tokenizer: AutoTokenizer, requests: list[GenerateRequest]
-) -> list[str]:
+) -> tuple[list[str], int]:
     prompts = [r.prompt for r in requests]
     max_tokens = max(r.max_tokens for r in requests)
 
@@ -48,7 +55,9 @@ def run_generation(
     inputs = tokenizer(prompts, return_tensors="pt", padding=True)
     outputs = model.generate(**inputs, max_new_tokens=max_tokens)
 
-    return tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    # ((padded prompt + generation length) - (padded prompt length)) * batch size
+    total_new_tokens = (outputs.shape[1] - inputs["input_ids"].shape[1]) * len(requests)
+    return tokenizer.batch_decode(outputs, skip_special_tokens=True), total_new_tokens
 
 
 async def start_engine_loop(
@@ -66,18 +75,24 @@ async def start_engine_loop(
             except asyncio.QueueEmpty:
                 break
 
+        BATCH_SIZE.observe(len(batch))
         requests = [r for r, _ in batch]
         futures = [f for _, f in batch]
         # Run generations in a separate thread
         try:
-            completions = await asyncio.to_thread(run_generation, model, tokenizer, requests)
+            completions, total_new_tokens = await asyncio.to_thread(
+                run_generation, model, tokenizer, requests
+            )
             for future, completion in zip(futures, completions, strict=True):
                 if not future.cancelled():
                     future.set_result(completion)
+            REQUESTS_TOTAL.inc(len(batch))
+            TOKENS_GENERATED.inc(total_new_tokens)
         except Exception as e:
             for future in futures:
                 if not future.cancelled():
                     future.set_exception(e)
+            REQUESTS_FAILED.inc(len(batch))
 
 
 app = FastAPI(lifespan=lifespan)
@@ -100,4 +115,5 @@ async def get_health():
 
 @app.get("/metrics")
 def get_metrics():
-    return "Getting metrics..."
+    QUEUE_DEPTH.set(app.state.queue.qsize())
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
