@@ -14,7 +14,8 @@ RUN uv sync --frozen --no-dev
 
 # Create unprivileged user
 RUN useradd --create-home --uid 1000 appuser \
-    && chown -R appuser:appuser /app
+    && mkdir -p /home/appuser/.cache/huggingface /home/appuser/.cache/uv \
+    && chown -R appuser:appuser /app /home/appuser
 USER appuser
 
 EXPOSE 8000

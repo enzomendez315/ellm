@@ -1,0 +1,12 @@
+services:
+  ellm:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - hf-cache:/home/appuser/.cache/huggingface
+    environment:
+      - HF_HOME=/home/appuser/.cache/huggingface
+
+volumes:
+  hf-cache:
